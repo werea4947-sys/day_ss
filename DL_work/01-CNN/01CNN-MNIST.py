@@ -8,8 +8,9 @@ from pathlib import Path
 BATCH_SIZE = 64 #每批数据的大小
 EPOCHS = 10 #训练轮数
 LR = 0.001 #学习率
-train_path = './DL-SY/MNIST_data' #训练数据路径
-test_path = './DL-SY/MNIST_data' #测试数据路径
+data_root = Path(__file__).resolve().parent / 'MNIST_data'
+train_path = str(data_root) #训练数据路径
+test_path = str(data_root) #测试数据路径
 
 #加载mnist数据集
 #训练数据集
@@ -17,6 +18,7 @@ train_data = torchvision.datasets.MNIST(
     root=train_path, #数据集存放路径
     train=True, #是否为训练集
     transform=torchvision.transforms.ToTensor(), #将图像转换为Tensor
+    download=True,
 )
 
 #测试数据集
@@ -24,6 +26,7 @@ test_data = torchvision.datasets.MNIST(
     root=test_path, #数据集存放路径
     train=False, #是否为测试集
     transform=torchvision.transforms.ToTensor(), #将图像转换为Tensor
+    download=True,
 )
 
 #分批训练 sample_size = 64 channel_size = 1 图像大小为28*28 （64，1，28，28）
