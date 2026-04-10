@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import torchvision
+from pathlib import Path
 
 #超参数
 BATCH_SIZE = 64 #每批数据的大小
@@ -97,6 +98,7 @@ for epoch in range(EPOCHS):
     cnn.train() #设置模型为训练模式
     #batch_idx是批次索引 x_in是输入数据 y_label是标签
     for batch_idx, (x_in, y_label) in enumerate(train_loader):       
+        optimizer.zero_grad() #每个batch前清空梯度，避免梯度累计
         output = cnn(x_in) #前向传播
         loss = criterion(output, y_label) #计算损失
         loss.backward() #反向传播
@@ -120,3 +122,5 @@ def evaluate(model, test_loader):
 
     accuracy = correct / total #计算准确率
     print('Test Accuracy: {:.2f}%'.format(accuracy * 100)) #打印准确率
+
+evaluate(cnn, test_loader)
