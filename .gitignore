@@ -1,0 +1,33 @@
+# IDE and editor settings (local/private)
+.vscode/
+.idea/
+*.code-workspace
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# Local secrets and environment files
+.env
+.env.*
+*.local
+*.secret
+
+# OS files
+.DS_Store
+Thumbs.db
