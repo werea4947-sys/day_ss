@@ -3,18 +3,24 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import torchvision
 
+#超参数
+BATCH_SIZE = 64 #每批数据的大小
+EPOCHS = 10 #训练轮数
+LR = 0.001 #学习率
+train_path = './DL-SY/MNIST_data' #训练数据路径
+test_path = './DL-SY/MNIST_data' #测试数据路径
 
 #加载mnist数据集
 #训练数据集
 train_data = torchvision.datasets.MNIST(
-    root='./MNIST_data', #数据集存放路径
+    root=train_path, #数据集存放路径
     train=True, #是否为训练集
     transform=torchvision.transforms.ToTensor(), #将图像转换为Tensor
 )
 
 #测试数据集
 test_data = torchvision.datasets.MNIST(
-    root='./MNIST_data', #数据集存放路径
+    root=test_path, #数据集存放路径
     train=False, #是否为测试集
     transform=torchvision.transforms.ToTensor(), #将图像转换为Tensor
 )
@@ -81,10 +87,7 @@ class CNN(nn.Module):
     
 #实例化模型
 cnn = CNN()
-#超参数
-BATCH_SIZE = 64 #每批数据的大小
-EPOCHS = 10 #训练轮数
-LR = 0.001 #学习率
+
 #优化器和损失函数
 criterion = nn.CrossEntropyLoss() #交叉熵损失函数
 optimizer = torch.optim.Adam(cnn.parameters(), lr=LR) #Adam优化器
