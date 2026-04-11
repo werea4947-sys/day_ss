@@ -1,18 +1,26 @@
+import os
+
+# Workaround for Windows OpenMP duplicate runtime conflicts (libiomp5md.dll).
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import torchvision
 from pathlib import Path
+import swanlab
+import matplotlib.pyplot as plt
 
 #超参数
 BATCH_SIZE = 64 #每批数据的大小
-EPOCHS = 10 #训练轮数
-LR = 0.001 #学习率
+EPOCHS = 15 #训练轮数
+LR = 0.0015 #学习率
 data_root = Path(__file__).resolve().parent / 'MNIST_data'
 train_path = str(data_root) #训练数据路径
 test_path = str(data_root) #测试数据路径
 
-#加载mnist数据集
+#加载mnist数据集 train：60000张训练图像 test：10000张测试图像
 #训练数据集
 train_data = torchvision.datasets.MNIST(
     root=train_path, #数据集存放路径
@@ -96,9 +104,21 @@ cnn = CNN()
 criterion = nn.CrossEntropyLoss() #交叉熵损失函数
 optimizer = torch.optim.Adam(cnn.parameters(), lr=LR) #Adam优化器
 
+#初始化swanlab实验记录
+run = swanlab.init(
+    project="mnist-cnn",
+    experiment_name="cnn-loss-tracking",
+    config={
+        "batch_size": BATCH_SIZE,
+        "epochs": EPOCHS,
+        "lr": LR,
+    },
+)
+
 #训练模型
 for epoch in range(EPOCHS):
     cnn.train() #设置模型为训练模式
+    epoch_loss = 0.0
     #batch_idx是批次索引 x_in是输入数据 y_label是标签
     for batch_idx, (x_in, y_label) in enumerate(train_loader):       
         optimizer.zero_grad() #每个batch前清空梯度，避免梯度累计
@@ -106,8 +126,12 @@ for epoch in range(EPOCHS):
         loss = criterion(output, y_label) #计算损失
         loss.backward() #反向传播
         optimizer.step() #更新参数
+        epoch_loss += loss.item()
 
-    print('Epoch: ', epoch+1, 'Loss: {:.4f}'.format(loss.item())) #打印损失
+    avg_loss = epoch_loss / len(train_loader)
+    swanlab.log({"train/loss": avg_loss, "epoch": epoch + 1})
+
+    print('Epoch: ', epoch+1, 'Loss: {:.4f}'.format(avg_loss)) #打印损失
 
 torch.save(cnn.state_dict(), 'cnn_mnist.pth') #保存模型参数
 
@@ -116,14 +140,63 @@ def evaluate(model, test_loader):
     model.eval() #设置模型为评估模式
     correct = 0 #正确预测的数量
     total = 0 #总的样本数量
+    all_targets = []
+    all_predictions = []
     with torch.no_grad(): #不计算梯度
         for data, target in test_loader:
             output = model(data) #前向传播
             _, predicted = torch.max(output.data, 1) #获取预测结果
             total += target.size(0) #更新总的样本数量
             correct += (predicted == target).sum().item() #更新正确预测的数量
+            all_targets.append(target)
+            all_predictions.append(predicted)
 
     accuracy = correct / total #计算准确率
     print('Test Accuracy: {:.2f}%'.format(accuracy * 100)) #打印准确率
 
-evaluate(cnn, test_loader)
+    targets = torch.cat(all_targets)
+    predictions = torch.cat(all_predictions)
+    confusion_matrix = torch.zeros(10, 10, dtype=torch.int64)
+    for t, p in zip(targets, predictions):
+        confusion_matrix[t.long(), p.long()] += 1
+
+    print('Confusion Matrix:')
+    print(confusion_matrix)
+    return confusion_matrix
+
+
+def plot_confusion_matrix(confusion_matrix):
+    plt.figure(figsize=(7, 6))
+    plt.imshow(confusion_matrix.numpy(), interpolation='nearest', cmap='Blues')
+    plt.title('MNIST Confusion Matrix')
+    plt.colorbar()
+    tick_marks = list(range(10))
+    plt.xticks(tick_marks, tick_marks)
+    plt.yticks(tick_marks, tick_marks)
+    plt.xlabel('Predicted Label')
+    plt.ylabel('True Label')
+    plt.tight_layout()
+    plt.show()
+
+
+def classify_one_image(model, dataset, index=0):
+    model.eval()
+    image, true_label = dataset[index]
+    with torch.no_grad():
+        output = model(image.unsqueeze(0))
+        predicted_label = int(torch.argmax(output, dim=1).item())
+
+    print(f'Single Image Classification -> index: {index}, true: {true_label}, predicted: {predicted_label}')
+
+    plt.figure(figsize=(3, 3))
+    plt.imshow(image.squeeze(0).numpy(), cmap='gray')
+    plt.title(f'True: {true_label} | Pred: {predicted_label}')
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+cm = evaluate(cnn, test_loader)
+plot_confusion_matrix(cm)
+classify_one_image(cnn, test_data, index=0)
+
+run.finish()
