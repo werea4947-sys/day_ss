@@ -143,28 +143,28 @@ def evaluate(model, test_loader):
     all_targets = []
     all_predictions = []
     with torch.no_grad(): #不计算梯度
-        for data, target in test_loader:
-            output = model(data) #前向传播
+        for x_in, y_label in test_loader:
+            output = model(x_in) #前向传播
             _, predicted = torch.max(output.data, 1) #获取预测结果
-            total += target.size(0) #更新总的样本数量
-            correct += (predicted == target).sum().item() #更新正确预测的数量
-            all_targets.append(target)
-            all_predictions.append(predicted)
+            total += y_label.size(0) #更新总的样本数量
+            correct += (predicted == y_label).sum().item() #更新正确预测的数量
+            all_targets.append(y_label) #保存目标标签
+            all_predictions.append(predicted) #保存预测结果
 
     accuracy = correct / total #计算准确率
     print('Test Accuracy: {:.2f}%'.format(accuracy * 100)) #打印准确率
 
-    targets = torch.cat(all_targets)
-    predictions = torch.cat(all_predictions)
-    confusion_matrix = torch.zeros(10, 10, dtype=torch.int64)
-    for t, p in zip(targets, predictions):
-        confusion_matrix[t.long(), p.long()] += 1
+    targets = torch.cat(all_targets) #将所有的目标标签连接成一个张量
+    predictions = torch.cat(all_predictions) #将所有的预测结果连接成一个张量
+    confusion_matrix = torch.zeros(10, 10, dtype=torch.int64) #初始化混淆矩阵，10x10的矩阵，每行表示真实标签，每列表示预测标签
+    for t, p in zip(targets, predictions):#遍历每个真实标签和预测标签的组合，更新混淆矩阵中对应位置的计数
+        confusion_matrix[t.long(), p.long()] += 1 #将真实标签t和预测标签p转换为长整型索引，并在混淆矩阵中对应位置的计数加1
 
-    print('Confusion Matrix:')
+    print('Confusion Matrix:')#打印混淆矩阵
     print(confusion_matrix)
     return confusion_matrix
 
-
+#绘制混淆矩阵
 def plot_confusion_matrix(confusion_matrix):
     plt.figure(figsize=(7, 6))
     plt.imshow(confusion_matrix.numpy(), interpolation='nearest', cmap='Blues')
@@ -178,7 +178,7 @@ def plot_confusion_matrix(confusion_matrix):
     plt.tight_layout()
     plt.show()
 
-
+#分类单张图像
 def classify_one_image(model, dataset, index=0):
     model.eval()
     image, true_label = dataset[index]
@@ -194,7 +194,8 @@ def classify_one_image(model, dataset, index=0):
     plt.axis('off')
     plt.tight_layout()
     plt.show()
-
+    
+#评估模型并绘制混淆矩阵
 cm = evaluate(cnn, test_loader)
 plot_confusion_matrix(cm)
 classify_one_image(cnn, test_data, index=0)
