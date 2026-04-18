@@ -31,3 +31,10 @@ dist/
 # OS files
 .DS_Store
 Thumbs.db
+
+#docx,pdf, and other generated files
+*.docx
+*.pdf
+*.xlsx
+*.pptx
+*.csv
