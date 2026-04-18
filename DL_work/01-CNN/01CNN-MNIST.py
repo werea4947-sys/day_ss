@@ -1,6 +1,7 @@
 import os
 
-# Workaround for Windows OpenMP duplicate runtime conflicts (libiomp5md.dll).
+
+#这是一个针对Windows系统的OpenMP重复运行时冲突的解决方法，设置环境变量以避免冲突
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
