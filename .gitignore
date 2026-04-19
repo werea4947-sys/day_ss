@@ -38,3 +38,9 @@ Thumbs.db
 *.xlsx
 *.pptx
 *.csv
+
+#jpg, png, and other image files
+*.jpg
+*.jpeg
+*.png
+*.gif
