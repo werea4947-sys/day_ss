@@ -16,7 +16,7 @@ DATA_PATH = Path(__file__).with_name("实验3：数据集tang.npz")  # 数据集
 DEFAULT_WEIGHTS = Path(__file__).with_name("poetry_lstm.pth")  # 默认权重文件路径
 
 class Config:  # 统一放训练参数
-    batch_size = 128  # 批大小
+    batch_size = 64  # 批大小
     embed_dim = 128  # 词向量维度
     hidden_dim = 512  # LSTM 隐藏层维度
     num_layers = 2  # LSTM 层数
@@ -25,7 +25,7 @@ class Config:  # 统一放训练参数
     eta_min = 1e-6  # 余弦退火最小学习率
     scheduler = "none"  # 学习率调度器: none/cosine
     log_interval = 50  # 每隔多少个 batch 记录一次 step 日志
-    epochs = 30  # 训练轮数
+    epochs = 20  # 训练轮数
     max_gen_len = 80  # 最长生成长度
     top_k = 5  # 采样时保留前k个候选
 
