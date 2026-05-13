@@ -25,8 +25,8 @@ class Config:  # 统一放训练参数
     eta_min = 1e-6  # 余弦退火最小学习率
     scheduler = "none"  # 学习率调度器: none/cosine
     log_interval = 50  # 每隔多少个 batch 记录一次 step 日志
-    epochs = 20  # 训练轮数
-    max_gen_len = 80  # 最长生成长度
+    epochs = 50  # 训练轮数
+    max_gen_len = 125  # 最长生成长度
     top_k = 5  # 采样时保留前k个候选
 
 class PoetryDataset(Dataset):  # 诗词数据集封装
@@ -50,7 +50,7 @@ class PoetryModel(nn.Module):  # 诗歌生成模型
             hidden_dim,  # 隐藏维度
             num_layers=num_layers,  # LSTM 层数
             dropout=dropout if num_layers > 1 else 0.0,  # 多层时才在层间 dropout
-            batch_first=True,  # 输入形状为 [batch, seq, feature]
+            batch_first=True,  # 输入形状为   [batch, seq, feature]
         )  # LSTM 结束
         self.output_norm = nn.LayerNorm(hidden_dim)  #输出层归一化
         self.dropout = nn.Dropout(dropout)  #输出再做一次 dropout
@@ -68,7 +68,6 @@ class PoetryModel(nn.Module):  # 诗歌生成模型
 def load_data(path=DATA_PATH):  # 读取数据集
     data = np.load(path, allow_pickle=True)  # 加载 npz 文件
     return data["data"], data["ix2word"].item(), data["word2ix"].item()  # 返回三部分内容
-
 
 def build_model(word2ix):  # 根据词表构建模型
     return PoetryModel(  # 返回模型实例
