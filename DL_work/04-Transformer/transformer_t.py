@@ -1,7 +1,26 @@
+"""
+基于 nn.Transformer 从零搭建的中英神经机器翻译（改进版）。
+
+相对原 transformer_t.py 的主要改进：
+1. 用 SentencePiece 训练子词（BPE）词表，替换词级词表，解决 10 万句上严重的 OOV 问题；
+2. 模型放大：d_model=256, nhead=8, layers=4, ffn=1024；
+3. 加入 label smoothing（0.1）与 Noam warmup 学习率调度；
+4. 验证用批量贪心解码（一次编码、逐步解码），并用 dev BLEU 做早停；
+5. BLEU 计算用 sacrebleu，目标为英文用默认分词、目标为中文用 tokenize='zh'。
+
+依赖：
+    pip install torch sentencepiece sacrebleu
+运行示例：
+    python transformer_t_v2.py --mode train --direction zh2en --epochs 20
+    python transformer_t_v2.py --mode eval  --direction zh2en
+    python transformer_t_v2.py --mode translate --direction zh2en --src "北约 不少 飞机 不得不 返航"
+"""
+
 import argparse
 import math
-import tarfile 
-from collections import Counter 
+import os
+import tarfile
+import tempfile
 from pathlib import Path
 
 import torch
@@ -9,323 +28,377 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
 import sacrebleu
+import sentencepiece as spm
 
+try:
+    import swanlab
+except Exception:
+    swanlab = None
+# 运行时是否成功初始化了 swanlab（启用且 init 成功才为 True）
+swan_run = None
 
-# 特殊符号：用于填充、句首、句尾和未登录词
-SPECIALS = ["<pad>", "<bos>", "<eos>", "<unk>"]
-PAD, BOS, EOS, UNK = SPECIALS
-# 默认数据包路径：和脚本放在同一目录下
+# SentencePiece 里固定特殊符号的 id，和下面的常量保持一致
+PAD_ID, BOS_ID, EOS_ID, UNK_ID = 0, 1, 2, 3
+
 DEFAULT_DATA = Path(__file__).with_name("实验4：数据集sample.tar.gz")
-# 默认权重保存路径：训练后写入同目录
-DEFAULT_WEIGHTS = Path(__file__).with_name("transformer_t.pth")
+DEFAULT_WEIGHTS = Path(__file__).with_name("transformer_t_v2.pth")
 
 
-def read_text_lines(path: Path) -> list[str]:
-	# 读取普通文本文件；如果传入的是压缩包则不在这里处理
-	if path.is_dir():
-		return path.read_text(encoding="utf-8").splitlines()
-	if path.suffixes[-2:] == [".tar", ".gz"]:
-		raise ValueError("请使用 load_from_tar 读取 .tar.gz 数据包")
-	return path.read_text(encoding="utf-8").splitlines()
-
-
+# ----------------------------- 数据读取 -----------------------------
 def read_member_lines(tar: tarfile.TarFile, member_name: str) -> list[str]:
-	# 从 tar.gz 数据包中读取指定成员文件的所有行
-	member = tar.extractfile(member_name)
-	if member is None:
-		raise FileNotFoundError(member_name)
-	return member.read().decode("utf-8", errors="ignore").splitlines()
+    member = tar.extractfile(member_name)
+    if member is None:
+        raise FileNotFoundError(member_name)
+    return member.read().decode("utf-8", errors="ignore").splitlines()
 
 
-def split_paired_lines(lines: list[str]) -> list[tuple[list[str], list[str]]]:
-	# 将交错排列的“源句/目标句”行切成成对样本
-	rows = [line.strip() for line in lines if line.strip()]
-	if len(rows) < 2:
-		return []
-	pairs = []
-	for i in range(0, len(rows) - 1, 2):
-		src = rows[i].split()
-		tgt = rows[i + 1].split()
-		if src and tgt:
-			pairs.append((src, tgt))
-	return pairs
+def split_paired_lines(lines: list[str]) -> list[tuple[str, str]]:
+    # 把交错排列的“源句/目标句”切成成对字符串（保留原始空格分词，交给 SP 再切子词）
+    rows = [line.strip() for line in lines if line.strip()]
+    pairs = []
+    for i in range(0, len(rows) - 1, 2):
+        if rows[i] and rows[i + 1]:
+            pairs.append((rows[i], rows[i + 1]))
+    return pairs
 
- 
+
 def load_from_tar(path: Path):
-	# 读取实验数据包中的训练集、开发集、测试集和参考译文
-	with tarfile.open(path, "r:gz") as tar:
-		train_src = read_member_lines(tar, "sample-submission-version/TM-training-set/chinese.txt")
-		train_tgt = read_member_lines(tar, "sample-submission-version/TM-training-set/english.txt")
-		dev_lines = read_member_lines(tar, "sample-submission-version/Dev-set/Niu.dev.txt")
-		test_lines = read_member_lines(tar, "sample-submission-version/Test-set/Niu.test.txt")
-		ref_lines = read_member_lines(tar, "sample-submission-version/Reference-for-evaluation/Niu.test.reference")
+    # 读取训练集、开发集、测试集和参考译文，全部返回“字符串”而非已切分的 token 列表
+    with tarfile.open(path, "r:gz") as tar:
+        train_src = read_member_lines(tar, "sample-submission-version/TM-training-set/chinese.txt")
+        train_tgt = read_member_lines(tar, "sample-submission-version/TM-training-set/english.txt")
+        dev_lines = read_member_lines(tar, "sample-submission-version/Dev-set/Niu.dev.txt")
+        test_lines = read_member_lines(tar, "sample-submission-version/Test-set/Niu.test.txt")
+        ref_lines = read_member_lines(tar, "sample-submission-version/Reference-for-evaluation/Niu.test.reference")
 
-	train_pairs = [(s.split(), t.split()) for s, t in zip(train_src, train_tgt) if s.strip() and t.strip()]
-	dev_pairs = split_paired_lines(dev_lines)
-	test_src = [line.split() for line in test_lines if line.strip()]
-	test_ref_pairs = split_paired_lines(ref_lines)
-	test_ref = [tgt for _, tgt in test_ref_pairs]
-	return train_pairs, dev_pairs, test_src, test_ref
-
-
-def build_vocab(seqs: list[list[str]]) -> dict[str, int]:
-	# 按词频构建词表，并把特殊符号放在最前面
-	counter = Counter(token for seq in seqs for token in seq)
-	vocab = {token: idx for idx, token in enumerate(SPECIALS)}
-	for token, _ in counter.most_common():
-		if token not in vocab:
-			vocab[token] = len(vocab)
-	return vocab
+    train_pairs = [(s.strip(), t.strip()) for s, t in zip(train_src, train_tgt) if s.strip() and t.strip()]
+    dev_pairs = split_paired_lines(dev_lines)            # (zh, en)
+    test_src = [line.strip() for line in test_lines if line.strip()]   # zh
+    test_ref = [tgt for _, tgt in split_paired_lines(ref_lines)]       # en
+    return train_pairs, dev_pairs, test_src, test_ref
 
 
-def encode(seq: list[str], vocab: dict[str, int], add_bos: bool = False, add_eos: bool = False) -> list[int]:
-	# 把词序列转成下标序列，可选加入句首和句尾标记
-	ids = []
-	if add_bos:
-		ids.append(vocab[BOS])
-	ids.extend(vocab.get(token, vocab[UNK]) for token in seq)
-	if add_eos:
-		ids.append(vocab[EOS])
-	return ids
+def orient(pairs, direction):
+    # zh2en：原始就是 (zh, en)；en2zh：交换为 (en, zh)
+    if direction == "en2zh":
+        return [(t, s) for s, t in pairs]
+    return pairs
 
 
-def pad_sequences(batch: list[list[int]], pad_idx: int) -> torch.Tensor:
-	# 把不等长序列补齐成同一长度的张量
-	max_len = max(len(seq) for seq in batch)
-	data = torch.full((len(batch), max_len), pad_idx, dtype=torch.long)
-	for i, seq in enumerate(batch):
-		data[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)
-	return data
+# ----------------------------- 子词词表 -----------------------------
+def train_spm(texts: list[str], model_prefix: str, vocab_size: int, coverage: float):
+    # 在训练语料上训练一个 SentencePiece(BPE) 模型，固定 pad/bos/eos/unk 的 id
+    if Path(model_prefix + ".model").exists():
+        return
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+        f.write("\n".join(texts))
+        tmp_path = f.name
+    try:
+        spm.SentencePieceTrainer.train(
+            input=tmp_path,
+            model_prefix=model_prefix,
+            vocab_size=vocab_size,
+            model_type="bpe",
+            character_coverage=coverage,
+            pad_id=PAD_ID, bos_id=BOS_ID, eos_id=EOS_ID, unk_id=UNK_ID,
+            pad_piece="<pad>", bos_piece="<bos>", eos_piece="<eos>", unk_piece="<unk>",
+        )
+    finally:
+        os.unlink(tmp_path)
 
 
+def load_spm(model_prefix: str) -> spm.SentencePieceProcessor:
+    sp = spm.SentencePieceProcessor()
+    sp.load(model_prefix + ".model")
+    return sp
+
+
+def sp_encode(sp, text: str) -> list[int]:
+    return [BOS_ID] + sp.encode(text, out_type=int) + [EOS_ID]
+
+
+def sp_decode(sp, ids: list[int]) -> str:
+    ids = [i for i in ids if i not in (PAD_ID, BOS_ID, EOS_ID)]
+    return sp.decode(ids)
+
+
+# ----------------------------- 数据集 -----------------------------
 class TranslationDataset(Dataset):
-	# 翻译数据集：每条样本返回“源句 + 目标句”
-	def __init__(self, pairs: list[tuple[list[str], list[str]]], src_vocab: dict[str, int], tgt_vocab: dict[str, int]):
-		self.pairs = pairs
-		self.src_vocab = src_vocab
-		self.tgt_vocab = tgt_vocab
+    def __init__(self, pairs, sp_src, sp_tgt, max_len):
+        self.pairs = pairs
+        self.sp_src = sp_src
+        self.sp_tgt = sp_tgt
+        self.max_len = max_len
 
-	def __len__(self) -> int:
-		# 数据集样本数
-		return len(self.pairs)
+    def __len__(self):
+        return len(self.pairs)
 
-	def __getitem__(self, index: int):
-		# 取出一条样本并编码
-		src, tgt = self.pairs[index]
-		return encode(src, self.src_vocab, add_bos=True, add_eos=True), encode(tgt, self.tgt_vocab, add_bos=True, add_eos=True)
-
-
-def make_collate_fn(pad_idx_src: int, pad_idx_tgt: int):
-	# DataLoader 的批处理函数：分别对源句和目标句补齐
-	def collate(batch):
-		src_batch, tgt_batch = zip(*batch)
-		return pad_sequences(list(src_batch), pad_idx_src), pad_sequences(list(tgt_batch), pad_idx_tgt)
-
-	return collate
+    def __getitem__(self, index):
+        src, tgt = self.pairs[index]
+        return (sp_encode(self.sp_src, src)[: self.max_len],
+                sp_encode(self.sp_tgt, tgt)[: self.max_len])
 
 
+def pad_sequences(batch, pad_idx):
+    max_len = max(len(seq) for seq in batch)
+    data = torch.full((len(batch), max_len), pad_idx, dtype=torch.long)
+    for i, seq in enumerate(batch):
+        data[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)
+    return data
+
+
+def collate(batch):
+    src_batch, tgt_batch = zip(*batch)
+    return pad_sequences(list(src_batch), PAD_ID), pad_sequences(list(tgt_batch), PAD_ID)
+
+
+# ----------------------------- 模型 -----------------------------
 class PositionalEncoding(nn.Module):
-	# 正弦位置编码，为 Transformer 提供位置信息
-	def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
-		super().__init__()
-		self.dropout = nn.Dropout(dropout)
-		# 预先计算所有位置的位置编码
-		pe = torch.zeros(max_len, d_model)
-		position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-		div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-		pe[:, 0::2] = torch.sin(position * div_term)
-		pe[:, 1::2] = torch.cos(position * div_term)
-		self.register_buffer("pe", pe.unsqueeze(0))
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))
 
-	def forward(self, x: torch.Tensor) -> torch.Tensor:
-		# 把位置编码加到词向量上，再做 dropout
-		x = x + self.pe[:, : x.size(1)]
-		return self.dropout(x)
+    def forward(self, x):
+        x = x + self.pe[:, : x.size(1)]
+        return self.dropout(x)
 
 
 class TransformerMT(nn.Module):
-	# 简化版 Transformer 翻译模型
-	def __init__(self, src_vocab_size: int, tgt_vocab_size: int, d_model: int = 128, nhead: int = 4, num_layers: int = 2, dim_feedforward: int = 256, dropout: float = 0.1):
-		super().__init__()
-		# 源语言和目标语言分别使用独立嵌入层
-		self.src_embed = nn.Embedding(src_vocab_size, d_model)
-		self.tgt_embed = nn.Embedding(tgt_vocab_size, d_model)
-		self.pos = PositionalEncoding(d_model, dropout)
-		# 直接使用 PyTorch 自带 Transformer 组件
-		self.transformer = nn.Transformer(
-			d_model=d_model,
-			nhead=nhead,
-			num_encoder_layers=num_layers,
-			num_decoder_layers=num_layers,
-			dim_feedforward=dim_feedforward,
-			dropout=dropout,
-			batch_first=True,
-		)
-		# 最后一层线性映射到目标词表大小
-		self.fc = nn.Linear(d_model, tgt_vocab_size)
+    def __init__(self, src_vocab, tgt_vocab, d_model=256, nhead=8,
+                 num_layers=4, dim_feedforward=1024, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.src_embed = nn.Embedding(src_vocab, d_model, padding_idx=PAD_ID)
+        self.tgt_embed = nn.Embedding(tgt_vocab, d_model, padding_idx=PAD_ID)
+        self.pos = PositionalEncoding(d_model, dropout)
+        self.transformer = nn.Transformer(
+            d_model=d_model, nhead=nhead,
+            num_encoder_layers=num_layers, num_decoder_layers=num_layers,
+            dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True,
+        )
+        self.fc = nn.Linear(d_model, tgt_vocab)
 
-	def forward(self, src, tgt, src_key_padding_mask=None, tgt_key_padding_mask=None):
-		# 前向传播：源句编码、目标句解码、输出词表 logits
-		src = self.pos(self.src_embed(src) * math.sqrt(self.src_embed.embedding_dim))
-		tgt = self.pos(self.tgt_embed(tgt) * math.sqrt(self.tgt_embed.embedding_dim))
-		# 生成目标端的因果掩码，防止看到未来词
-		tgt_mask = torch.triu(torch.ones(tgt.size(1), tgt.size(1), device=tgt.device, dtype=torch.bool), diagonal=1)
-		out = self.transformer(
-			src,
-			tgt,
-			tgt_mask=tgt_mask,
-			src_key_padding_mask=src_key_padding_mask,
-			tgt_key_padding_mask=tgt_key_padding_mask,
-			memory_key_padding_mask=src_key_padding_mask,
-		)
-		return self.fc(out)
+    def encode(self, src, src_pad):
+        src_e = self.pos(self.src_embed(src) * math.sqrt(self.d_model))
+        return self.transformer.encoder(src_e, src_key_padding_mask=src_pad)
+
+    def decode(self, tgt, memory, src_pad, tgt_pad):
+        tgt_e = self.pos(self.tgt_embed(tgt) * math.sqrt(self.d_model))
+        tgt_mask = torch.triu(
+            torch.ones(tgt.size(1), tgt.size(1), device=tgt.device, dtype=torch.bool), diagonal=1)
+        out = self.transformer.decoder(
+            tgt_e, memory, tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_pad, memory_key_padding_mask=src_pad)
+        return self.fc(out)
+
+    def forward(self, src, tgt, src_pad, tgt_pad):
+        memory = self.encode(src, src_pad)
+        return self.decode(tgt, memory, src_pad, tgt_pad)
 
 
-def build_masks(src: torch.Tensor, tgt_in: torch.Tensor, pad_idx: int):
-	# 生成源端和目标端的 padding mask
-	src_pad = src.eq(pad_idx)
-	tgt_pad = tgt_in.eq(pad_idx)
-	return src_pad, tgt_pad
+# ----------------------------- 学习率调度（Noam warmup） -----------------------------
+def noam_scheduler(optimizer, d_model, warmup_steps):
+    def lr_lambda(step):
+        step = max(step, 1)
+        return (d_model ** -0.5) * min(step ** -0.5, step * (warmup_steps ** -1.5))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def train(model, loader, optimizer, criterion, device, pad_idx_src, pad_idx_tgt, epochs: int):
-	# 训练循环：逐批更新参数
-	model.train()
-	for epoch in range(1, epochs + 1):
-		total_loss = 0.0
-		for src, tgt in loader:
-			src = src.to(device)
-			tgt = tgt.to(device)
-			tgt_in = tgt[:, :-1]
-			tgt_out = tgt[:, 1:]
-			src_mask, tgt_mask = build_masks(src, tgt_in, pad_idx_src)
-			logits = model(src, tgt_in, src_mask, tgt_mask)
-			loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
-			optimizer.zero_grad()
-			loss.backward()
-			torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-			optimizer.step()
-			total_loss += loss.item()
-		print(f"epoch {epoch}/{epochs} loss={total_loss / max(len(loader), 1):.4f}")
+# ----------------------------- 训练与解码 -----------------------------
+def train_one_epoch(model, loader, optimizer, scheduler, criterion, device):
+    model.train()
+    total_loss, n = 0.0, 0
+    for src, tgt in loader:
+        src, tgt = src.to(device), tgt.to(device)
+        tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
+        src_pad, tgt_pad = src.eq(PAD_ID), tgt_in.eq(PAD_ID)
+        logits = model(src, tgt_in, src_pad, tgt_pad)
+        loss = criterion(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+        total_loss += loss.item()
+        n += 1
+    return total_loss / max(n, 1)
 
 
 @torch.no_grad()
-def greedy_decode(model, src_tokens, src_vocab, tgt_vocab, inv_tgt_vocab, device, max_len: int = 40):
-	# 贪心解码：每一步取概率最大的词
-	model.eval()
-	src = torch.tensor([encode(src_tokens, src_vocab, add_bos=True, add_eos=True)], dtype=torch.long, device=device)
-	src_pad = src.eq(src_vocab[PAD])
-	generated = [tgt_vocab[BOS]]
-	for _ in range(max_len):
-		tgt = torch.tensor([generated], dtype=torch.long, device=device)
-		tgt_pad = tgt.eq(tgt_vocab[PAD])
-		logits = model(src, tgt, src_pad, tgt_pad)
-		next_id = int(logits[0, -1].argmax().item())
-		if next_id == tgt_vocab[EOS]:
-			break
-		generated.append(next_id)
-	tokens = [inv_tgt_vocab[idx] for idx in generated[1:] if idx in inv_tgt_vocab and inv_tgt_vocab[idx] not in {PAD, BOS, EOS}]
-	return tokens
+def batched_greedy_decode(model, src, device, max_len=80):
+    # 一次编码、逐步解码的批量贪心，比逐句解码快很多
+    model.eval()
+    src = src.to(device)
+    src_pad = src.eq(PAD_ID)
+    memory = model.encode(src, src_pad)
+    b = src.size(0)
+    ys = torch.full((b, 1), BOS_ID, dtype=torch.long, device=device)
+    finished = torch.zeros(b, dtype=torch.bool, device=device)
+    for _ in range(max_len):
+        tgt_pad = ys.eq(PAD_ID)
+        logits = model.decode(ys, memory, src_pad, tgt_pad)
+        nxt = logits[:, -1].argmax(-1)
+        nxt = nxt.masked_fill(finished, PAD_ID)
+        ys = torch.cat([ys, nxt.unsqueeze(1)], dim=1)
+        finished = finished | nxt.eq(EOS_ID)
+        if bool(finished.all()):
+            break
+    return ys.tolist()
 
 
-def evaluate(model, data, src_vocab, tgt_vocab, device):
-	# 在开发集或测试集上计算 sacrebleu 的标准 BLEU4
-	inv_tgt_vocab = {idx: token for token, idx in tgt_vocab.items()}
-	references = []
-	candidates = []
-	for src_tokens, ref_tokens in data:
-		pred_tokens = greedy_decode(model, src_tokens, src_vocab, tgt_vocab, inv_tgt_vocab, device)
-		references.append(" ".join(ref_tokens))
-		candidates.append(" ".join(pred_tokens))
-	if not references or not candidates:
-		return 0.0
-	return float(sacrebleu.corpus_bleu(candidates, [references]).score)
+@torch.no_grad()
+def evaluate(model, pairs, sp_src, sp_tgt, device, tgt_lang, max_len=80, batch_size=64):
+    model.eval()
+    candidates, references = [], []
+    for i in range(0, len(pairs), batch_size):
+        chunk = pairs[i:i + batch_size]
+        src_ids = [sp_encode(sp_src, s)[:max_len] for s, _ in chunk]
+        src = pad_sequences(src_ids, PAD_ID)
+        outs = batched_greedy_decode(model, src, device, max_len)
+        for (_, ref), out in zip(chunk, outs):
+            candidates.append(sp_decode(sp_tgt, out))
+            references.append(ref)
+    if not candidates:
+        return 0.0
+    tok = "zh" if tgt_lang == "zh" else "13a"
+    return float(sacrebleu.corpus_bleu(candidates, [references], tokenize=tok).score)
 
 
+# ----------------------------- 主流程 -----------------------------
 def main():
-	# 命令行入口：支持训练、评估和单句翻译
-	parser = argparse.ArgumentParser(description="Simple Transformer MT")
-	parser.add_argument("--mode", choices=["train", "eval", "translate"], default="train")
-	parser.add_argument("--data", type=str, default=str(DEFAULT_DATA))
-	parser.add_argument("--weights", type=str, default=str(DEFAULT_WEIGHTS))
-	parser.add_argument("--epochs", type=int, default=1)
-	parser.add_argument("--batch-size", type=int, default=64)
-	parser.add_argument("--lr", type=float, default=1e-3)
-	parser.add_argument("--d-model", type=int, default=64)
-	parser.add_argument("--nhead", type=int, default=4)
-	parser.add_argument("--layers", type=int, default=1)
-	parser.add_argument("--ffn-dim", type=int, default=128)
-	parser.add_argument("--dropout", type=float, default=0.1)
-	parser.add_argument("--max-len", type=int, default=40)
-	parser.add_argument("--src", type=str, default="")
-	args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Transformer MT (subword + warmup + label smoothing)")
+    parser.add_argument("--mode", choices=["train", "eval", "translate"], default="train")
+    parser.add_argument("--direction", choices=["zh2en", "en2zh"], default="zh2en")
+    parser.add_argument("--data", type=str, default=str(DEFAULT_DATA))
+    parser.add_argument("--weights", type=str, default=str(DEFAULT_WEIGHTS))
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--d-model", type=int, default=256)
+    parser.add_argument("--nhead", type=int, default=8)
+    parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument("--ffn-dim", type=int, default=1024)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--warmup", type=int, default=4000)
+    parser.add_argument("--label-smoothing", type=float, default=0.1)
+    parser.add_argument("--vocab-size", type=int, default=8000)
+    parser.add_argument("--max-len", type=int, default=80)
+    parser.add_argument("--patience", type=int, default=4, help="dev BLEU 多少轮不提升就早停")
+    parser.add_argument("--src", type=str, default="")
+    # swanlab 日志（可选）：--use-swanlab 开启
+    parser.add_argument("--use-swanlab", action="store_true", help="启用 swanlab 记录训练日志")
+    parser.add_argument("--swanlab-project", type=str, default="transformer_mt")
+    parser.add_argument("--swanlab-run-name", type=str, default=None)
+    args = parser.parse_args()
 
-	# 检查数据文件是否存在，并且确实是压缩包
-	data_path = Path(args.data)
-	if not data_path.exists():
-		raise FileNotFoundError(f"找不到数据文件: {data_path}")
-	if data_path.suffixes[-2:] != [".tar", ".gz"]:
-		raise ValueError("当前脚本默认读取 sample.tar.gz 数据包")
+    data_path = Path(args.data)
+    if not data_path.exists():
+        raise FileNotFoundError(f"找不到数据文件: {data_path}")
 
-	# 读取数据并分别构建源语言和目标语言词表
-	train_pairs, dev_pairs, test_src, test_ref = load_from_tar(data_path)
-	src_vocab = build_vocab([src for src, _ in train_pairs])
-	tgt_vocab = build_vocab([tgt for _, tgt in train_pairs])
-	pad_idx_src = src_vocab[PAD]
-	pad_idx_tgt = tgt_vocab[PAD]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tgt_lang = "en" if args.direction == "zh2en" else "zh"
 
-	# 构建 DataLoader、模型、损失函数和优化器
-	train_set = TranslationDataset(train_pairs, src_vocab, tgt_vocab)
-	loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, collate_fn=make_collate_fn(pad_idx_src, pad_idx_tgt))
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	model = TransformerMT(len(src_vocab), len(tgt_vocab), args.d_model, args.nhead, args.layers, args.ffn_dim, args.dropout).to(device)
-	weights_path = Path(args.weights)
-	criterion = nn.CrossEntropyLoss(ignore_index=pad_idx_tgt)
-	optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # 读取并按方向摆正
+    train_pairs, dev_pairs, test_src, test_ref = load_from_tar(data_path)
+    train_pairs = orient(train_pairs, args.direction)
+    dev_pairs = orient(dev_pairs, args.direction)
+    if args.direction == "en2zh":
+        test_src, test_ref = test_ref, test_src   # 源变英文、参考变中文
 
-	# 训练模式：训练后保存权重，并在开发集上做一次简单评估
-	if args.mode == "train":
-		train(model, loader, optimizer, criterion, device, pad_idx_src, pad_idx_tgt, args.epochs)
-		torch.save({"model": model.state_dict(), "src_vocab": src_vocab, "tgt_vocab": tgt_vocab}, weights_path)
-		print(f"saved to {weights_path}")
-		if dev_pairs:
-			bleu = evaluate(model, dev_pairs, src_vocab, tgt_vocab, device)
-			print(f"dev BLEU4: {bleu:.4f}")
-		return
+    # 训练（或复用）两个 SentencePiece 子词模型；不同方向不同覆盖率
+    w = Path(args.weights)
+    src_prefix = str(w.with_name(w.stem + f"_sp_src_{args.direction}"))
+    tgt_prefix = str(w.with_name(w.stem + f"_sp_tgt_{args.direction}"))
+    src_cov = 0.9995 if args.direction == "zh2en" else 1.0
+    tgt_cov = 1.0 if args.direction == "zh2en" else 0.9995
+    train_spm([s for s, _ in train_pairs], src_prefix, args.vocab_size, src_cov)
+    train_spm([t for _, t in train_pairs], tgt_prefix, args.vocab_size, tgt_cov)
+    sp_src, sp_tgt = load_spm(src_prefix), load_spm(tgt_prefix)
 
-	# 非训练模式下先加载权重；如果没有权重就先训练一个 epoch
-	if weights_path.exists():
-		checkpoint = torch.load(weights_path, map_location=device)
-		model.load_state_dict(checkpoint["model"])
-		src_vocab = checkpoint.get("src_vocab", src_vocab)
-		tgt_vocab = checkpoint.get("tgt_vocab", tgt_vocab)
-	else:
-		print("未找到权重，先训练 1 个 epoch")
-		train(model, loader, optimizer, criterion, device, pad_idx_src, pad_idx_tgt, 1)
+    model = TransformerMT(
+        sp_src.get_piece_size(), sp_tgt.get_piece_size(),
+        args.d_model, args.nhead, args.layers, args.ffn_dim, args.dropout).to(device)
 
-	# 评估模式：输出开发集和测试集 BLEU4
-	if args.mode == "eval":
-		if dev_pairs:
-			bleu = evaluate(model, dev_pairs, src_vocab, tgt_vocab, device)
-			print(f"dev BLEU4: {bleu:.4f}")
-		if test_ref:
-			preds = [greedy_decode(model, src, src_vocab, tgt_vocab, {idx: tok for tok, idx in tgt_vocab.items()}, device, args.max_len) for src in test_src]
-			references = [" ".join(ref) for ref in test_ref]
-			candidates = [" ".join(pred) for pred in preds]
-			bleu = float(sacrebleu.corpus_bleu(candidates, [references]).score)
-			print(f"test BLEU4: {bleu:.4f}")
-		return
+    if args.mode == "train":
+        global swan_run
+        if args.use_swanlab:
+            if swanlab is None:
+                print("警告: 未安装 swanlab，跳过日志记录。安装: pip install swanlab")
+            else:
+                try:
+                    swan_run = swanlab.init(
+                        project=args.swanlab_project,
+                        experiment_name=args.swanlab_run_name,
+                        config=vars(args),
+                    )
+                except Exception as e:
+                    print(f"swanlab 初始化失败，继续训练: {e}")
+                    swan_run = None
 
-	# 翻译模式：输入一个分好词的源句，输出目标句
-	if args.mode == "translate":
-		if not args.src.strip():
-			raise ValueError("translate 模式需要提供 --src")
-		src_tokens = args.src.strip().split()
-		inv_tgt_vocab = {idx: token for token, idx in tgt_vocab.items()}
-		out = greedy_decode(model, src_tokens, src_vocab, tgt_vocab, inv_tgt_vocab, device, args.max_len)
-		print(" ".join(out))
+        loader = DataLoader(
+            TranslationDataset(train_pairs, sp_src, sp_tgt, args.max_len),
+            batch_size=args.batch_size, shuffle=True, collate_fn=collate)
+        criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID, label_smoothing=args.label_smoothing)
+        # Noam 配合 base lr=1.0，betas/eps 用原论文设置
+        optimizer = torch.optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9)
+        scheduler = noam_scheduler(optimizer, args.d_model, args.warmup)
+
+        best_bleu, no_improve = 0.0, 0
+        for epoch in range(1, args.epochs + 1):
+            loss = train_one_epoch(model, loader, optimizer, scheduler, criterion, device)
+            bleu = evaluate(model, dev_pairs, sp_src, sp_tgt, device, tgt_lang, args.max_len)
+            print(f"epoch {epoch}/{args.epochs}  loss={loss:.4f}  dev_BLEU4={bleu:.2f}")
+            if swan_run is not None:
+                lr_now = scheduler.get_last_lr()[0]
+                swanlab.log({"train/loss": loss, "dev/bleu4": bleu, "lr": lr_now}, step=epoch)
+            if bleu > best_bleu:
+                best_bleu, no_improve = bleu, 0
+                torch.save({"model": model.state_dict(), "args": vars(args)}, w)
+                print(f"  新最佳 BLEU={bleu:.2f}，已保存到 {w}")
+            else:
+                no_improve += 1
+            if bleu > 14:
+                print(f"dev BLEU4 已达到 {bleu:.2f} (>14)，提前停止。")
+                break
+            if no_improve >= args.patience:
+                print(f"连续 {args.patience} 轮无提升，提前停止。")
+                break
+        print(f"训练结束，最佳 dev BLEU4 = {best_bleu:.2f}")
+        if swan_run is not None:
+            swanlab.log({"dev/best_bleu4": best_bleu})
+            try:
+                swanlab.finish()
+            except Exception:
+                pass
+        return
+
+    # eval / translate 需要先加载权重
+    if not w.exists():
+        raise FileNotFoundError(f"未找到权重 {w}，请先用 --mode train 训练。")
+    model.load_state_dict(torch.load(w, map_location=device)["model"])
+
+    if args.mode == "eval":
+        dev_bleu = evaluate(model, dev_pairs, sp_src, sp_tgt, device, tgt_lang, args.max_len)
+        print(f"dev  BLEU4: {dev_bleu:.2f}")
+        if test_src and test_ref:
+            n = min(len(test_src), len(test_ref))
+            test_pairs = list(zip(test_src[:n], test_ref[:n]))
+            test_bleu = evaluate(model, test_pairs, sp_src, sp_tgt, device, tgt_lang, args.max_len)
+            print(f"test BLEU4: {test_bleu:.2f}")
+        return
+
+    if args.mode == "translate":
+        if not args.src.strip():
+            raise ValueError("translate 模式需要 --src")
+        src = pad_sequences([sp_encode(sp_src, args.src.strip())[: args.max_len]], PAD_ID)
+        out = batched_greedy_decode(model, src, device, args.max_len)[0]
+        print(sp_decode(sp_tgt, out))
 
 
 if __name__ == "__main__":
-	# 直接运行脚本时进入主函数
-	main()
+    main()
