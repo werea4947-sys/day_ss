@@ -1,27 +1,13 @@
-"""
-基于 nn.Transformer 从零搭建的中英神经机器翻译（改进版）。
-
-相对原 transformer_t.py 的主要改进：
-1. 用 SentencePiece 训练子词（BPE）词表，替换词级词表，解决 10 万句上严重的 OOV 问题；
-2. 模型放大：d_model=256, nhead=8, layers=4, ffn=1024；
-3. 加入 label smoothing（0.1）与 Noam warmup 学习率调度；
-4. 验证用批量贪心解码（一次编码、逐步解码），并用 dev BLEU 做早停；
-5. BLEU 计算用 sacrebleu，目标为英文用默认分词、目标为中文用 tokenize='zh'。
-
-依赖：
-    pip install torch sentencepiece sacrebleu
-运行示例：
-    python transformer_t_v2.py --mode train --direction zh2en --epochs 20
-    python transformer_t_v2.py --mode eval  --direction zh2en
-    python transformer_t_v2.py --mode translate --direction zh2en --src "北约 不少 飞机 不得不 返航"
-"""
-
 import argparse
 import math
 import os
 import tarfile
 import tempfile
 from pathlib import Path
+
+import warnings
+# 抑制 PyTorch 关于 nested tensors 的原型阶段警告（无害，可忽略）
+warnings.filterwarnings("ignore", message=".*nested tensors.*", category=UserWarning)
 
 import torch
 import torch.nn as nn
@@ -45,6 +31,7 @@ DEFAULT_WEIGHTS = Path(__file__).with_name("transformer_t_v2.pth")
 
 
 # ----------------------------- 数据读取 -----------------------------
+# 读取 tar.gz 里的文本文件，返回字符串列表；切分成对字符串；根据翻译方向交换源/目标
 def read_member_lines(tar: tarfile.TarFile, member_name: str) -> list[str]:
     member = tar.extractfile(member_name)
     if member is None:
@@ -71,6 +58,7 @@ def load_from_tar(path: Path):
         test_lines = read_member_lines(tar, "sample-submission-version/Test-set/Niu.test.txt")
         ref_lines = read_member_lines(tar, "sample-submission-version/Reference-for-evaluation/Niu.test.reference")
 
+    # 切分成对字符串，并根据翻译方向交换源/目标
     train_pairs = [(s.strip(), t.strip()) for s, t in zip(train_src, train_tgt) if s.strip() and t.strip()]
     dev_pairs = split_paired_lines(dev_lines)            # (zh, en)
     test_src = [line.strip() for line in test_lines if line.strip()]   # zh
@@ -173,22 +161,22 @@ class TransformerMT(nn.Module):
     def __init__(self, src_vocab, tgt_vocab, d_model=256, nhead=8,
                  num_layers=4, dim_feedforward=1024, dropout=0.1):
         super().__init__()
-        self.d_model = d_model
+        self.d_model = d_model 
         self.src_embed = nn.Embedding(src_vocab, d_model, padding_idx=PAD_ID)
-        self.tgt_embed = nn.Embedding(tgt_vocab, d_model, padding_idx=PAD_ID)
-        self.pos = PositionalEncoding(d_model, dropout)
-        self.transformer = nn.Transformer(
+        self.tgt_embed = nn.Embedding(tgt_vocab, d_model, padding_idx=PAD_ID) #词表嵌入
+        self.pos = PositionalEncoding(d_model, dropout) #位置嵌入
+        self.transformer = nn.Transformer( #transformer主体
             d_model=d_model, nhead=nhead,
             num_encoder_layers=num_layers, num_decoder_layers=num_layers,
             dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True,
         )
         self.fc = nn.Linear(d_model, tgt_vocab)
 
-    def encode(self, src, src_pad):
+    def encode(self, src, src_pad): #编码器输入：源句子和源句子padding掩码；输出：编码器记忆
         src_e = self.pos(self.src_embed(src) * math.sqrt(self.d_model))
         return self.transformer.encoder(src_e, src_key_padding_mask=src_pad)
 
-    def decode(self, tgt, memory, src_pad, tgt_pad):
+    def decode(self, tgt, memory, src_pad, tgt_pad): #解码器输入：目标句子、编码器记忆、源句子padding掩码、目标句子padding掩码；输出：解码器输出（未归一化的词表分布）
         tgt_e = self.pos(self.tgt_embed(tgt) * math.sqrt(self.d_model))
         tgt_mask = torch.triu(
             torch.ones(tgt.size(1), tgt.size(1), device=tgt.device, dtype=torch.bool), diagonal=1)
@@ -267,7 +255,7 @@ def evaluate(model, pairs, sp_src, sp_tgt, device, tgt_lang, max_len=80, batch_s
     if not candidates:
         return 0.0
     tok = "zh" if tgt_lang == "zh" else "13a"
-    return float(sacrebleu.corpus_bleu(candidates, [references], tokenize=tok).score)
+    return float(sacrebleu.corpus_bleu(candidates, [references], tokenize=tok, force=True).score)
 
 
 # ----------------------------- 主流程 -----------------------------
@@ -276,7 +264,7 @@ def main():
     parser.add_argument("--mode", choices=["train", "eval", "translate"], default="train")
     parser.add_argument("--direction", choices=["zh2en", "en2zh"], default="zh2en")
     parser.add_argument("--data", type=str, default=str(DEFAULT_DATA))
-    parser.add_argument("--weights", type=str, default=str(DEFAULT_WEIGHTS))
+    parser.add_argument("--weights", type=str, default="", help="权重文件路径，若不指定则根据 --direction 使用 zh2en.pth/en2zh.pth")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--d-model", type=int, default=256)
@@ -290,6 +278,7 @@ def main():
     parser.add_argument("--max-len", type=int, default=80)
     parser.add_argument("--patience", type=int, default=4, help="dev BLEU 多少轮不提升就早停")
     parser.add_argument("--src", type=str, default="")
+    parser.add_argument("--no-early-stop", action="store_true", help="禁用基于 dev BLEU 的提前停止")
     # swanlab 日志（可选）：--use-swanlab 开启
     parser.add_argument("--use-swanlab", action="store_true", help="启用 swanlab 记录训练日志")
     parser.add_argument("--swanlab-project", type=str, default="transformer_mt")
@@ -311,7 +300,11 @@ def main():
         test_src, test_ref = test_ref, test_src   # 源变英文、参考变中文
 
     # 训练（或复用）两个 SentencePiece 子词模型；不同方向不同覆盖率
-    w = Path(args.weights)
+    # 如果用户没有传入显式的 --weights，则根据 --direction 使用方向相关的默认权重文件（zh2en.pth / en2zh.pth）
+    if args.weights == str(DEFAULT_WEIGHTS) or not args.weights:
+        w = Path(__file__).with_name(f"{args.direction}.pth")
+    else:
+        w = Path(args.weights)
     src_prefix = str(w.with_name(w.stem + f"_sp_src_{args.direction}"))
     tgt_prefix = str(w.with_name(w.stem + f"_sp_tgt_{args.direction}"))
     src_cov = 0.9995 if args.direction == "zh2en" else 1.0
@@ -362,12 +355,14 @@ def main():
                 print(f"  新最佳 BLEU={bleu:.2f}，已保存到 {w}")
             else:
                 no_improve += 1
-            if bleu > 14:
-                print(f"dev BLEU4 已达到 {bleu:.2f} (>14)，提前停止。")
-                break
-            if no_improve >= args.patience:
-                print(f"连续 {args.patience} 轮无提升，提前停止。")
-                break
+            # 根据用户选项决定是否提前停止
+            if not args.no_early_stop:
+                if bleu > 14:
+                    print(f"dev BLEU4 已达到 {bleu:.2f} (>14)，提前停止。")
+                    break
+                if no_improve >= args.patience:
+                    print(f"连续 {args.patience} 轮无提升，提前停止。")
+                    break
         print(f"训练结束，最佳 dev BLEU4 = {best_bleu:.2f}")
         if swan_run is not None:
             swanlab.log({"dev/best_bleu4": best_bleu})
@@ -380,7 +375,13 @@ def main():
     # eval / translate 需要先加载权重
     if not w.exists():
         raise FileNotFoundError(f"未找到权重 {w}，请先用 --mode train 训练。")
-    model.load_state_dict(torch.load(w, map_location=device)["model"])
+    # 兼容不同保存格式：{"model": state_dict} 或直接 state_dict
+    ckpt = torch.load(w, map_location=device)
+    if isinstance(ckpt, dict) and ("model" in ckpt or "state_dict" in ckpt):
+        state = ckpt.get("model", ckpt.get("state_dict"))
+    else:
+        state = ckpt
+    model.load_state_dict(state)
 
     if args.mode == "eval":
         dev_bleu = evaluate(model, dev_pairs, sp_src, sp_tgt, device, tgt_lang, args.max_len)

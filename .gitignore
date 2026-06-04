@@ -46,3 +46,7 @@ Thumbs.db
 *.gif
 *.npz
 *.pth
+
+# TensorBoard logs and checkpoints
+*.vocab
+*.model
